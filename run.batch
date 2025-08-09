@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=MMDQR
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=80GB
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --output=job_output_MMDQR_Atari.out
+#SBATCH --tasks-per-node=12
+#SBATCH --time=7-00:00:00
+#SBATCH --mail-user=ludvig.killingberg@ntnu.no
+#SBATCH --account=share-ie-idi
+#SBATCH --mail-type=ALL
+#SBATCH --gres=gpu:1
+##SBATCH --constraint="A100"
+#SBATCH --partition=GPUQ
+
+julia --project=. -O train.jl --lambda 0.5 --game breakout

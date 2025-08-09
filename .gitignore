@@ -1,0 +1,5 @@
+.CondaPkg
+wandb
+Manifest.toml
+
+.DS_Store
