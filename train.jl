@@ -1,5 +1,5 @@
 using ArgParse
-using Lux, Optimisers
+using Lux, Optimisers, LuxCUDA
 using ReinforcementLearningTrajectories
 import CommonRLInterface as CRL
 using Gymnasium
@@ -11,6 +11,8 @@ using Statistics
 using MLUtils
 using ChainRulesCore
 using Zygote
+using NNlib: gather
+
 
 function q_val(state, net, ps, st)
     ys, st = Lux.apply(net, state, ps, st)
@@ -23,24 +25,23 @@ function q_val(ys)
     return dropdims(mean(ys, dims = 1), dims = 1)
 end
 
-function multiquadric_kernel(x, y; c = 1.0f0)
-    # The multiquadric kernel is defined as sqrt(‖x - y‖² + c²)
-    return sqrt(sum(abs2, x .- y) + c^2)
+# Avoid scalar loops; work with (N, B) matrices directly.
+# Uses the identity ||xi - yj||^2 = ||xi||^2 + ||yj||^2 - 2 xi⋅yj
+@inline function pairwise_multiquadric(X::AbstractMatrix{T}, Y::AbstractMatrix{T}; c::T = T(1)) where {T<:AbstractFloat}
+    # X, Y: (N, Bx) and (N, By)
+    # returns (Bx, By)
+    x2 = sum(abs2, X; dims=1)               # (1, Bx)
+    y2 = sum(abs2, Y; dims=1)               # (1, By)
+    XY = permutedims(X) * Y                 # (Bx, By)
+    d2 = @. max(x2' + y2 - 2*XY, zero(T))   # numerical safety
+    return sqrt.(d2 .+ c^2)
 end
 
-function mmd_loss_multiquadric(ŷ, y; c = 1.0f0)
-    # MMD loss is calculated as:
-    # MMD²(X, Y) = E[k(X, X')] - 2E[k(X, Y)] + E[k(Y, Y')]
-    
-    # Calculate the kernel matrices
-    K_ŷŷ = [multiquadric_kernel(ŷ[:, i], ŷ[:, j]; c=c) for i in 1:size(ŷ, 2), j in 1:size(ŷ, 2)]
-    K_yy = [multiquadric_kernel(y[:, i], y[:, j]; c=c) for i in 1:size(y, 2), j in 1:size(y, 2)]
-    K_ŷy = [multiquadric_kernel(ŷ[:, i], y[:, j]; c=c) for i in 1:size(ŷ, 2), j in 1:size(y, 2)]
-    
-    # Calculate the mean of the kernel matrices
-    mmd2 = (mean(K_ŷŷ) - 2 * mean(K_ŷy) + mean(K_yy))
-    
-    return mmd2
+@inline function mmd_loss_multiquadric(Ŷ::AbstractMatrix{T}, Y::AbstractMatrix{T}; c::T = T(1)) where {T<:AbstractFloat}
+    Kxx = pairwise_multiquadric(Ŷ, Ŷ; c=c)
+    Kyy = pairwise_multiquadric(Y,  Y;  c=c)
+    Kxy = pairwise_multiquadric(Ŷ, Y;  c=c)
+    return mean(Kxx) - 2T(1)*mean(Kxy) + mean(Kyy)
 end
 
 function quantile_huber_loss(ŷ, y; κ = 1.0f0)
@@ -59,15 +60,51 @@ function quantile_huber_loss(ŷ, y; κ = 1.0f0)
     return mean(sum(loss; dims = 1))
 end
 
+# Build this ONCE outside the loop and pass it in.
+@inline function make_cum_prob(N::Integer, T=Float32, dev=gpu_device())
+    return dev(range(T(1)/(2N), step=T(1)/N, length=N) |> collect)
+end
+
+@inline function quantile_huber_loss(ŷ::AbstractMatrix{T}, y::AbstractMatrix{T}, cum_prob::AbstractVector{T}; κ::T = T(1)) where {T<:AbstractFloat}
+    # ŷ, y: (N, B); cum_prob: (N,)
+    Δ = @views y .- ŷ                       # (N, B)
+    abs_error = abs.(Δ)
+    q = min.(abs_error, κ)
+    huber = T(0.5) .* q .* q .+ κ .* (abs_error .- q)
+
+    # Broadcast cum_prob across batch (N,1) vs (N,B)
+    # indicator(Δ < 0) is non-differentiable; keep as Bool → Float
+    I = @. abs(cum_prob - (Δ < 0))
+    return mean(sum(I .* huber; dims=1))
+end
+
+function select_actions(ys::CuArray{T,3}, actions::CuArray{Int}) where {T}
+    N, na, B = size(ys)
+
+    # Turn actions into a (1,B) array, then broadcast to shape (N,B)
+    idx_na = reshape(actions, 1, B) |> gpu_device()
+    idx_na = repeat(idx_na, N, 1)  # (N,B)
+
+    # Row indices 1:N, repeated across batch
+    idx_n = repeat(reshape(1:N, N, 1), 1, B) |> gpu_device()
+
+    # Batch indices 1:B, repeated across N
+    idx_b = repeat(reshape(1:B, 1, B), N, 1) |> gpu_device()
+
+    # Now gather wants a tuple of index arrays, all same shape
+    return gather(ys, (idx_n, idx_na, idx_b))  # (N,B)
+end
+
+
 function train(game="breakout"; lambda::Float32=0.5f0)
     seed = 123
     rng = Random.default_rng()
     Random.seed!(rng, seed)
 
-    N = 200
+    N = 50
     B = 32
-    lr = 0.00005
-    grad_clip = 10.0
+    lr = 0.00005f0
+    grad_clip = 10.0f0
     ρ = 0.005f0
     n_step = 1
     EVAL_EVERY = 250_000
@@ -122,7 +159,7 @@ function train(game="breakout"; lambda::Float32=0.5f0)
 
     buffer = Trajectory(
         CircularArraySARTSTraces(;
-            capacity = 1_000_000,
+            capacity = 100_000,
             state = Float32 => (84, 84, 4),
             action = Int => (),
             reward = Float32 => (),
@@ -157,16 +194,16 @@ function train(game="breakout"; lambda::Float32=0.5f0)
         l = 0
         approx_loss = 0
         total_reward = 0
-        mean_q = []
-        GC.gc()
         while !CRL.terminated(env)
             l += 1
             eps_threshold = max(eps_min, 1 - (1 - eps_min) * t / eps_decay)
             if rand() < eps_threshold
                 action = CRL.actions(env) |> rand
             else
-                state = (unsqueeze(CRL.observe(env), dims = 4) ./ 255.0f0) |> gdev
-                q, st = q_val(state, net, ps, st)
+                # state = (unsqueeze(CRL.observe(env), dims = 4) ./ 255.0f0) |> gdev
+                sdev = gpu_device()(unsqueeze(CRL.observe(env), dims=4)) .* (1f0/255)
+
+                q, st = q_val(sdev, net, ps, st)
                 # q, st = Lux.apply(net, state, ps, st)
                 ai = argmax(q |> vec)
                 action = CRL.actions(env)[ai]
@@ -182,19 +219,20 @@ function train(game="breakout"; lambda::Float32=0.5f0)
                 bs = (batch.next_state ./ 255.0f0) |> gdev
                 ys1, st = Lux.apply(net, bs, target_ps, st)
                 q = dropdims(mean(ys1, dims = 1), dims = 1)
-                a = dropdims(argmax(q; dims = 1); dims = 1)
+                a = getindex.(vec(argmax(q; dims = 1)), 1)
 
-                @views ys1 = ys1[:, a]
-
-                target_ys = 0.99f0^n_step .* ys1 .* gdev(reshape(1 .- batch.terminal, 1, B)) .+ gdev(reshape(batch.reward, 1, B))
-                a_ind = CartesianIndex.(batch.action, 1:length(batch.action))
+                # @views ys1 = ys1[:, a]
+                ys1_sel = select_actions(ys1, a)        # (N, B)
+                target_ys = 0.99f0^n_step .* ys1_sel .* gdev(reshape(1 .- batch.terminal, 1, B)) .+ gdev(reshape(batch.reward, 1, B))
+                # a_ind = CartesianIndex.(batch.action, 1:length(batch.action))
 
                 state = (batch.state ./ 255.0f0) |> gdev
                 res = Zygote.withgradient(ps) do ps
                     ys2, st = Lux.apply(net, state, ps, st)
-                    ys2 = ys2[:, a_ind]
-                    loss = lambda * quantile_huber_loss(ys2, target_ys)
-                    loss += (1 - lambda) * mmd_loss_multiquadric(ys2, target_ys)
+                    # ys2 = ys2[:, a_ind]
+                    ys2_sel = select_actions(ys2, batch.action)  # (N, B)
+                    loss = lambda * quantile_huber_loss(ys2_sel, target_ys)
+                    loss += (1 - lambda) * mmd_loss_multiquadric(ys2_sel, target_ys)
                     loss
                 end
                 grads = res.grad |> only
@@ -233,11 +271,8 @@ function train(game="breakout"; lambda::Float32=0.5f0)
             end
         end
         approx_loss = approx_loss / l
-        if isempty(mean_q)
-            mean_q = [0]
-        end
         with_logger(lg) do
-            @info "metrics" loss = approx_loss reward = total_reward t = t l = l mean_q_val = mean(mean_q)
+            @info "metrics" loss = approx_loss reward = total_reward t = t l = l
         end
         ProgressMeter.update!(p, t; showvalues = [("step", t), ("score", total_reward), ("loss", round(approx_loss; digits = 3))])
     end
